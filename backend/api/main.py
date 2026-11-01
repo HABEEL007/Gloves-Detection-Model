@@ -1,36 +1,26 @@
-import os
-import sys
-import argparse
+"""
+FastAPI Application Entrypoint for Gloves Detection Module.
+Exposes RESTful endpoints for health, model metadata, image inference,
+and asynchronous offline 3 FPS video processing.
+"""
 from pathlib import Path
-from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+from fastapi.staticfiles import StaticFiles
 
-# Ensure backend root is on sys.path
-BACKEND_DIR = Path(__file__).resolve().parent.parent
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
-
-from api.dependencies import get_context
-from api.routes import router
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    ctx = get_context()
-    ctx.start()
-    print("[+] Gloves Detection Backend Started Successfully")
-    yield
-    ctx.stop()
-    print("[*] Gloves Detection Backend Stopped")
+from ..model.config import config
+from ..model.model_loader import get_model_manager
+from .routes import router
 
 app = FastAPI(
-    title="Gloves Compliance Detection API",
-    description="Modular backend for real-time glove detection, tracking, and temporal compliance verification.",
-    version="2.0.0",
-    lifespan=lifespan
+    title=config.API_TITLE,
+    description="Production-Ready AI Detection, Tracking, Alerting and 3 FPS Offline Video Processing for Glove Compliance",
+    version=config.API_VERSION,
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,13 +29,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount Evidence Snapshots Directory
+evidence_dir = Path(config.EVIDENCE_DIR).resolve()
+evidence_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/evidence", StaticFiles(directory=str(evidence_dir)), name="evidence")
+
+# Include Detection API Router
 app.include_router(router)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Gloves Detection Backend Server")
-    parser.add_argument("--port", type=int, default=5001, help="Port to run server on (default: 5001)")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host interface (default: 0.0.0.0)")
-    args = parser.parse_args()
 
-    uvicorn.run("api.main:app", host=args.host, port=args.port, reload=False)
+@app.on_event("startup")
+def startup_event():
+    """Warms up the model loader at application startup."""
+    try:
+        mgr = get_model_manager()
+        print(f"[API Startup] Loaded {mgr.architecture} from {mgr.current_weights_path} on {mgr.device}")
+    except Exception as e:
+        print(f"[API Startup Warning] Could not warm up model manager: {e}")
+
+
+@app.get("/")
+def root():
+    return {
+        "service": config.API_TITLE,
+        "version": config.API_VERSION,
+        "status": "online",
+        "docs": "/docs",
+        "health": "/api/v1/health"
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("backend.api.main:app", host="0.0.0.0", port=8000, reload=False)
 

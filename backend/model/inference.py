@@ -1,202 +1,303 @@
-from typing import List, Dict, Any, Tuple, Optional
-import numpy as np
+"""
+Standalone, reusable hand detection inference module.
+Wraps the loaded model manager, handles pre/post-processing timing,
+supports color-based skin/glove verification, and returns structured detections.
+"""
+import time
+import logging
+from typing import List, Dict, Any, Optional, Tuple, Union
+from pathlib import Path
 import cv2
+import numpy as np
 import torch
-from ultralytics import YOLO
 
 from .config import config
-from .model_loader import ModelLoader
+from .model_loader import get_model_manager, GloveModelManager
 
-class HandDetectionBox:
-    def __init__(self, box: List[float], confidence: float, class_id: int, class_name: str, glove_color: str = "unknown"):
-        self.box = box
-        self.confidence = float(confidence)
-        self.class_id = int(class_id)
-        self.class_name = str(class_name)
-        self.glove_color = str(glove_color)
+logger = logging.getLogger("backend.inference")
 
-class PoseDetectionResult:
+
+class DetectedHand:
+    """Structured representation of an individual detected hand."""
     def __init__(
         self,
-        person_idx: int,
-        person_box: List[float],
-        person_conf: float,
-        left_wrist: Optional[Dict[str, float]] = None,
-        right_wrist: Optional[Dict[str, float]] = None,
-        left_shoulder: Optional[Dict[str, float]] = None,
-        right_shoulder: Optional[Dict[str, float]] = None,
-        left_elbow: Optional[Dict[str, float]] = None,
-        right_elbow: Optional[Dict[str, float]] = None,
-        torso_x: Optional[float] = None
+        box: List[float],          # [x1, y1, x2, y2] in pixels
+        class_id: int,             # 0 = gloved_hand, 1 = bare_hand
+        confidence: float,         # Detection confidence [0.0 - 1.0]
+        class_name: str,           # "gloved_hand" or "bare_hand"
+        glove_color: str = "unknown"  # "black", "green", "bare", "other", "unknown"
     ):
-        self.person_idx = person_idx
-        self.person_box = person_box
-        self.person_conf = person_conf
-        self.left_wrist = left_wrist
-        self.right_wrist = right_wrist
-        self.left_shoulder = left_shoulder
-        self.right_shoulder = right_shoulder
-        self.left_elbow = left_elbow
-        self.right_elbow = right_elbow
-        self.torso_x = torso_x
+        self.box = [float(x) for x in box]
+        self.class_id = int(class_id)
+        self.confidence = float(confidence)
+        self.class_name = str(class_name)
+        self.glove_color = str(glove_color)
+        
+        # Derived geometric properties
+        self.x1, self.y1, self.x2, self.y2 = self.box
+        self.cx = (self.x1 + self.x2) / 2.0
+        self.cy = (self.y1 + self.y2) / 2.0
+        self.width = max(1.0, self.x2 - self.x1)
+        self.height = max(1.0, self.y2 - self.y1)
+        self.area = self.width * self.height
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "box": [round(x, 2) for x in self.box],
+            "class_id": self.class_id,
+            "class_name": self.class_name,
+            "confidence": round(self.confidence, 4),
+            "glove_color": self.glove_color,
+            "center": [round(self.cx, 2), round(self.cy, 2)],
+            "dimensions": [round(self.width, 2), round(self.height, 2)]
+        }
+
+
+class InferenceResult:
+    """Complete structured output from a single frame inference."""
+    def __init__(
+        self,
+        hands: List[DetectedHand],
+        timing: Dict[str, float],
+        frame_shape: Tuple[int, int],  # (height, width)
+        conf_threshold: float,
+        imgsz: int
+    ):
+        self.hands = hands
+        self.timing = timing
+        self.frame_shape = frame_shape
+        self.conf_threshold = conf_threshold
+        self.imgsz = imgsz
+
+    @property
+    def gloved_hands(self) -> List[DetectedHand]:
+        return [h for h in self.hands if h.class_id == 0]
+
+    @property
+    def bare_hands(self) -> List[DetectedHand]:
+        return [h for h in self.hands if h.class_id == 1]
+
+    @property
+    def total_hands(self) -> int:
+        return len(self.hands)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_hands": len(self.hands),
+            "gloved_count": len(self.gloved_hands),
+            "bare_count": len(self.bare_hands),
+            "detections": [h.to_dict() for h in self.hands],
+            "timing_ms": self.timing,
+            "frame_shape": list(self.frame_shape),
+            "conf_threshold": self.conf_threshold,
+            "imgsz": self.imgsz
+        }
+
 
 def evaluate_hand_color(frame: np.ndarray, box: List[float]) -> str:
-    """Classifies hand crop color into green, black, bare skin, or other."""
+    """
+    Analyzes the hand crop to distinguish skin from black, green, or other gloves.
+    Ensures exposed human skin is not misclassified as a dark glove.
+    """
     try:
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, int(box[0])), max(0, int(box[1]))
-        x2, y2 = min(w, int(box[2])), min(h, int(box[3]))
-        if (x2 - x1) < 14 or (y2 - y1) < 14:
+        img_h, img_w = frame.shape[:2]
+        x1 = max(0, int(box[0]))
+        y1 = max(0, int(box[1]))
+        x2 = min(img_w, int(box[2]))
+        y2 = min(img_h, int(box[3]))
+
+        if (x2 - x1) < 12 or (y2 - y1) < 12:
             return "unknown"
+
         crop = frame[y1:y2, x1:x2]
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        
-        # Green mask
-        lower_green = np.array([35, 40, 40], dtype=np.uint8)
-        upper_green = np.array([85, 255, 255], dtype=np.uint8)
-        green_mask = cv2.inRange(hsv, lower_green, upper_green)
-        green_ratio = float(np.sum(green_mask > 0)) / float(crop.shape[0] * crop.shape[1])
-        if green_ratio > 0.15:
+        ch, cw = crop.shape[:2]
+
+        # Sample central 70% of crop to minimize background / sleeve interference
+        cy1, cy2 = int(ch * 0.15), int(ch * 0.85)
+        cx1, cx2 = int(cw * 0.15), int(cw * 0.85)
+        center = crop[cy1:cy2, cx1:cx2] if (cy2 - cy1 >= 8 and cx2 - cx1 >= 8) else crop
+
+        # Downsample before color calculations for speed
+        h_, w_ = center.shape[:2]
+        if h_ > 48 or w_ > 48:
+            scale = 48.0 / max(h_, w_)
+            center = cv2.resize(
+                center,
+                (max(1, int(w_ * scale)), max(1, int(h_ * scale))),
+                interpolation=cv2.INTER_NEAREST
+            )
+
+        hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+        ycrcb = cv2.cvtColor(center, cv2.COLOR_BGR2YCrCb)
+
+        # 1. Skin tone detector (high Cr, moderate Cb)
+        skin_mask = (
+            (ycrcb[:, :, 1] >= 130) & (ycrcb[:, :, 1] <= 175) &
+            (ycrcb[:, :, 2] >= 75) & (ycrcb[:, :, 2] <= 130) &
+            (ycrcb[:, :, 0] > 60) &
+            (hsv[:, :, 1] > 18) & (hsv[:, :, 2] > 50)
+        )
+        skin_ratio = float(np.mean(skin_mask))
+
+        # 2. Green glove: HSV Hue 32-88 with saturation
+        green_hsv = (hsv[:, :, 0] >= 32) & (hsv[:, :, 0] <= 88) & (hsv[:, :, 1] > 35) & (hsv[:, :, 2] > 35)
+        green_bgr = (center[:, :, 1] > center[:, :, 0] * 1.15) & (center[:, :, 1] > center[:, :, 2] * 1.15) & (center[:, :, 1] > 40)
+        green_ratio = float(np.mean(green_hsv | green_bgr))
+
+        # 3. Dark/Black glove: V < 120, S < 140 or BGR all < 120
+        dark_hsv = (hsv[:, :, 2] < 120) & (hsv[:, :, 1] < 140)
+        dark_rgb = (center[:, :, 0] < 120) & (center[:, :, 1] < 120) & (center[:, :, 2] < 120)
+        dark_ratio = float(np.mean(dark_hsv | dark_rgb))
+
+        # Decision rules
+        if skin_ratio >= 0.12:
+            return "bare"
+        if green_ratio >= 0.18 and skin_ratio < 0.10:
             return "green"
-
-        # Dark/black mask
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        dark_ratio = float(np.sum(gray < 55)) / float(crop.shape[0] * crop.shape[1])
-        if dark_ratio > 0.35:
+        if dark_ratio >= 0.38 and skin_ratio < 0.08:
             return "black"
-
+        if skin_ratio >= 0.08:
+            return "bare"
         return "other"
     except Exception:
         return "unknown"
 
-class ModelInferenceEngine:
-    """
-    Executes hand detection and pose keypoint estimation on frames.
-    """
-    def __init__(self, loader: Optional[ModelLoader] = None):
-        self.loader = loader or ModelLoader()
-        self.hand_model: YOLO = self.loader.load_hand_model()
-        self.pose_model: YOLO = self.loader.load_pose_model()
 
-    def predict_hands(self, frame: np.ndarray, conf_threshold: Optional[float] = None) -> List[HandDetectionBox]:
-        conf = conf_threshold if conf_threshold is not None else config.HAND_CONF_THRESHOLD
-        use_half = config.HALF_PRECISION if str(config.DEVICE) != "cpu" else False
-        
-        try:
-            res = self.hand_model.predict(
-                source=frame,
-                device=config.DEVICE,
-                conf=conf,
-                imgsz=config.IMGSZ,
-                verbose=False,
-                half=use_half
-            )[0]
-        except Exception as e:
-            if "CUDA" in str(e) or "out of memory" in str(e).lower():
-                torch.cuda.empty_cache()
-                res = self.hand_model.predict(
+class HandDetector:
+    """
+    Reusable Hand Detector.
+    Encapsulates inference execution, timing instrumentation, and color refinement.
+    """
+    def __init__(
+        self,
+        model_manager: Optional[GloveModelManager] = None,
+        conf_threshold: Optional[float] = None,
+        imgsz: Optional[int] = None
+    ):
+        self.manager = model_manager or get_model_manager()
+        self.conf_threshold = conf_threshold or config.HAND_CONF_THRESHOLD
+        self.imgsz = imgsz or config.IMG_SIZE
+
+    def detect(
+        self,
+        frame: np.ndarray,
+        conf_threshold: Optional[float] = None,
+        imgsz: Optional[int] = None
+    ) -> InferenceResult:
+        """
+        Executes inference on a single numpy image frame.
+        Instruments preprocess, inference, and postprocess latency separately.
+        """
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            raise ValueError("Invalid image frame provided for inference.")
+
+        conf = conf_threshold if conf_threshold is not None else self.conf_threshold
+        target_imgsz = imgsz if imgsz is not None else self.imgsz
+        h, w = frame.shape[:2]
+
+        t_total_start = time.perf_counter()
+
+        with self.manager.inference_lock:
+            try:
+                # Execute inference via model predict
+                raw_results = self.manager.model.predict(
                     source=frame,
-                    device="cpu",
+                    device=self.manager.device,
                     conf=conf,
-                    imgsz=config.IMGSZ,
-                    verbose=False,
-                    half=False
+                    imgsz=target_imgsz,
+                    verbose=False
                 )[0]
-            else:
-                raise e
+            except Exception as e:
+                logger.error(f"Inference execution failed: {e}", exc_info=True)
+                # Return empty result rather than crashing
+                return InferenceResult(
+                    hands=[],
+                    timing={"preprocess_ms": 0.0, "inference_ms": 0.0, "postprocess_ms": 0.0, "total_ms": 0.0},
+                    frame_shape=(h, w),
+                    conf_threshold=conf,
+                    imgsz=target_imgsz
+                )
 
-        detections = []
-        if res.boxes is None or len(res.boxes) == 0:
-            return detections
+        t_post_start = time.perf_counter()
 
-        boxes = res.boxes.xyxy.cpu().numpy()
-        confs = res.boxes.conf.cpu().numpy()
-        classes = res.boxes.cls.cpu().numpy()
+        # Extract timing dict from ultralytics if available
+        speed_dict = getattr(raw_results, "speed", {})
+        prep_ms = float(speed_dict.get("preprocess", 0.0))
+        inf_ms = float(speed_dict.get("inference", 0.0))
+        post_ms = float(speed_dict.get("postprocess", 0.0))
 
-        for i in range(len(boxes)):
-            cid = int(classes[i])
-            c_score = float(confs[i])
-            b = boxes[i].tolist()
-            cname = config.CLASS_NAMES.get(cid, "gloved_hand" if cid == 0 else "bare_hand")
-            glove_color = evaluate_hand_color(frame, b) if cid == 0 else "bare"
-            detections.append(HandDetectionBox(
-                box=b,
-                confidence=c_score,
-                class_id=cid,
-                class_name=cname,
-                glove_color=glove_color
-            ))
+        detected_hands: List[DetectedHand] = []
 
-        return detections
+        if raw_results.boxes is not None and len(raw_results.boxes) > 0:
+            boxes = raw_results.boxes.xyxy.cpu().numpy()
+            confs = raw_results.boxes.conf.cpu().numpy()
+            classes = raw_results.boxes.cls.cpu().numpy()
 
-    def predict_pose(self, frame: np.ndarray) -> List[PoseDetectionResult]:
-        use_half = config.HALF_PRECISION if str(config.DEVICE) != "cpu" else False
-        try:
-            res = self.pose_model.predict(
-                source=frame,
-                device=config.DEVICE,
-                conf=config.PERSON_POSE_CONF_THRESHOLD,
-                imgsz=config.IMGSZ,
-                verbose=False,
-                half=use_half
-            )[0]
-        except Exception as e:
-            if "CUDA" in str(e) or "out of memory" in str(e).lower():
-                torch.cuda.empty_cache()
-                res = self.pose_model.predict(
-                    source=frame,
-                    device="cpu",
-                    conf=config.PERSON_POSE_CONF_THRESHOLD,
-                    imgsz=config.IMGSZ,
-                    verbose=False,
-                    half=False
-                )[0]
-            else:
-                raise e
+            for i in range(len(boxes)):
+                box = boxes[i].tolist()
+                c_score = float(confs[i])
+                raw_cid = int(classes[i])
 
-        results = []
-        if res.boxes is None or len(res.boxes) == 0 or res.keypoints is None:
-            return results
+                # Color-based skin/glove verification
+                color = evaluate_hand_color(frame, box)
 
-        boxes = res.boxes.xyxy.cpu().numpy()
-        confs = res.boxes.conf.cpu().numpy()
-        kpts_data = res.keypoints.data.cpu().numpy()
+                if color == "bare":
+                    # Exposed skin detected -> BARE HAND
+                    final_cid = 1
+                    final_cname = "bare_hand"
+                    glove_color = "bare"
+                elif color == "green":
+                    final_cid = 0
+                    final_cname = "gloved_hand"
+                    glove_color = "green"
+                elif color == "black":
+                    # Dark fabric with zero skin
+                    if raw_cid == 0 or c_score >= 0.35:
+                        final_cid = 0
+                        final_cname = "gloved_hand"
+                        glove_color = "black"
+                    else:
+                        final_cid = 1
+                        final_cname = "bare_hand"
+                        glove_color = "bare"
+                else:
+                    # Other / unknown
+                    if raw_cid == 0 and c_score >= 0.40:
+                        final_cid = 0
+                        final_cname = "gloved_hand"
+                        glove_color = "other"
+                    else:
+                        final_cid = raw_cid
+                        final_cname = self.manager.class_names.get(raw_cid, "bare_hand")
+                        glove_color = "bare" if final_cid == 1 else "other"
 
-        for idx in range(len(boxes)):
-            p_box = boxes[idx].tolist()
-            p_conf = float(confs[idx])
-            kpts = kpts_data[idx]
+                detected_hands.append(DetectedHand(
+                    box=box,
+                    class_id=final_cid,
+                    confidence=c_score,
+                    class_name=final_cname,
+                    glove_color=glove_color
+                ))
 
-            lw, rw, ls, rs, le, re = None, None, None, None, None, None
-            if len(kpts) > 10:
-                if kpts[9][2] >= config.WRIST_CONF_THRESHOLD:
-                    lw = {"x": float(kpts[9][0]), "y": float(kpts[9][1]), "conf": float(kpts[9][2])}
-                if kpts[10][2] >= config.WRIST_CONF_THRESHOLD:
-                    rw = {"x": float(kpts[10][0]), "y": float(kpts[10][1]), "conf": float(kpts[10][2])}
-            if len(kpts) > 6:
-                if kpts[5][2] >= 0.2:
-                    ls = {"x": float(kpts[5][0]), "y": float(kpts[5][1]), "conf": float(kpts[5][2])}
-                if kpts[6][2] >= 0.2:
-                    rs = {"x": float(kpts[6][0]), "y": float(kpts[6][1]), "conf": float(kpts[6][2])}
-            if len(kpts) > 8:
-                if kpts[7][2] >= 0.2:
-                    le = {"x": float(kpts[7][0]), "y": float(kpts[7][1]), "conf": float(kpts[7][2])}
-                if kpts[8][2] >= 0.2:
-                    re = {"x": float(kpts[8][0]), "y": float(kpts[8][1]), "conf": float(kpts[8][2])}
+        t_total_end = time.perf_counter()
+        total_ms = (t_total_end - t_total_start) * 1000.0
 
-            torso_x = (p_box[0] + p_box[2]) / 2.0
-            results.append(PoseDetectionResult(
-                person_idx=idx,
-                person_box=p_box,
-                person_conf=p_conf,
-                left_wrist=lw,
-                right_wrist=rw,
-                left_shoulder=ls,
-                right_shoulder=rs,
-                left_elbow=le,
-                right_elbow=re,
-                torso_x=torso_x
-            ))
+        # If speed dict had 0s, estimate
+        if inf_ms == 0.0:
+            inf_ms = total_ms - prep_ms
 
-        return results
+        timing = {
+            "preprocess_ms": round(prep_ms, 2),
+            "inference_ms": round(inf_ms, 2),
+            "postprocess_ms": round(post_ms, 2),
+            "total_ms": round(total_ms, 2)
+        }
+
+        return InferenceResult(
+            hands=detected_hands,
+            timing=timing,
+            frame_shape=(h, w),
+            conf_threshold=conf,
+            imgsz=target_imgsz
+        )
 
