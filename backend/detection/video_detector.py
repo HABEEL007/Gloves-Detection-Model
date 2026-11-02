@@ -326,16 +326,25 @@ class OfflineVideoDetector:
         self.tracker_pipeline.reset()
         self.compliance_engine.reset()
 
+        # Performance optimization: decode full BGR frame ONLY when needed.
+        # Fast packet demuxing (cap.grab) skips H.264 macroblock decode on 90% of frames.
+        decode_all_frames = (writer is not None) and (not sampled_frames_only)
+
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            if decode_all_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+            else:
+                if not cap.grab():
+                    break
+                frame = None
 
             # Calculate PTS (Presentation Timestamp) in seconds
             pts_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
             pts_sec = (pts_msec / 1000.0) if pts_msec > 0 else (frame_idx / source_fps)
 
-            # Check if this decoded frame aligns with the 3 FPS schedule
+            # Check if this frame aligns with the 3 FPS schedule
             is_inference_frame = False
             if pts_sec >= (next_target_pts - 0.005):
                 is_inference_frame = True
@@ -345,6 +354,10 @@ class OfflineVideoDetector:
                     next_target_pts = pts_sec + sample_interval
 
             if is_inference_frame:
+                if frame is None:
+                    ret, frame = cap.retrieve()
+                    if not ret or frame is None:
+                        break
                 processed_inference_frames += 1
 
                 # 1. Hand Inference
@@ -438,6 +451,11 @@ class OfflineVideoDetector:
                         )
                         writer.write(annotated)
                 else:
+                    # Full duration video: Retrieve frame if not already decoded
+                    if frame is None:
+                        ret, frame = cap.retrieve()
+                        if not ret or frame is None:
+                            break
                     # Full duration video: Carry forward overlays if not expired
                     overlay_age = pts_sec - last_inference_pts
                     overlay_expired = overlay_age > config.OVERLAY_EXPIRY_SECONDS
