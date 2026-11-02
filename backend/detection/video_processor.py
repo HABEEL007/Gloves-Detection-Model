@@ -209,13 +209,20 @@ class OnlineCCTVWorker:
             last_inf_time = now
             t0 = time.perf_counter()
 
-            # 1. Hand Detection
-            inf_res = self.hand_detector.detect(frame)
+            # 1. Person Detection & ByteTrack Tracking (Lightweight Stage)
+            active_tracks = self.tracker_pipeline.detect_and_track_persons(frame)
 
-            # 2. Tracking & Association
-            assoc_hands, active_tracks = self.tracker_pipeline.process(
-                frame, inf_res.hands, frame_idx=frame_count
-            )
+            # 2. Person-Gated Hand Detection (Heavy RT-DETR-L Stage)
+            # Glove detection service is ONLY activated when at least one person is detected in the frame.
+            if len(active_tracks) > 0 or not self.tracker_pipeline.enable_pose:
+                inf_res = self.hand_detector.detect(frame)
+                current_hands = inf_res.hands
+            else:
+                inf_res = None
+                current_hands = []
+
+            # 3. Association
+            assoc_hands = self.tracker_pipeline.associate_hands(frame, current_hands, active_tracks)
 
             # 3. Compliance Evaluation
             current_states = {}
@@ -283,8 +290,8 @@ class OnlineCCTVWorker:
                         "fps": round(avg_fps, 1),
                         "active_violations": self._active_violations_count,
                         "total_violations_today": self._total_violations_today,
-                        "gloved_hands_count": len(inf_res.gloved_hands),
-                        "bare_hands_count": len(inf_res.bare_hands),
+                        "gloved_hands_count": len(inf_res.gloved_hands) if inf_res else 0,
+                        "bare_hands_count": len(inf_res.bare_hands) if inf_res else 0,
                         "tracked_people": len(active_tracks),
                         "model_architecture": self.hand_detector.manager.architecture,
                         "rule_mode": self.rule_mode

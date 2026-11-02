@@ -124,31 +124,36 @@ class TrackingAndAssociationPipeline:
             self.tracker.frame_id = 0
             logger.info("Tracker state reset.")
 
+    def detect_and_track_persons(self, frame: np.ndarray) -> List[Any]:
+        """Runs pose estimation and updates ByteTrack person tracks."""
+        if self.enable_pose and self.pose_detector is not None and self.tracker is not None:
+            try:
+                pose_results = self.pose_detector.predict(frame)
+                return self.tracker.update(pose_results)
+            except Exception as e:
+                logger.error(f"Pose tracking error: {e}", exc_info=True)
+                return []
+        return []
+
+    def associate_hands(
+        self,
+        frame: np.ndarray,
+        detected_hands: List[DetectedHand],
+        active_tracks: List[Any]
+    ) -> List[AssociatedHand]:
+        """Associates detected hands to tracked persons."""
+        img_h, img_w = frame.shape[:2]
+        return self._associate(detected_hands, active_tracks, img_w, img_h)
+
     def process(
         self,
         frame: np.ndarray,
         detected_hands: List[DetectedHand],
         frame_idx: int = 0
     ) -> Tuple[List[AssociatedHand], List[Any]]:
-        """
-        Processes a frame:
-        1. Runs pose estimation (if enabled).
-        2. Updates ByteTrack person tracks.
-        3. Associates detected hands to tracked persons via multi-signal matching.
-        """
-        img_h, img_w = frame.shape[:2]
-        active_tracks: List[PersonTrack] = []
-
-        if self.enable_pose and self.pose_detector is not None and self.tracker is not None:
-            try:
-                pose_results = self.pose_detector.predict(frame)
-                active_tracks = self.tracker.update(pose_results)
-            except Exception as e:
-                logger.error(f"Pose tracking error: {e}", exc_info=True)
-                active_tracks = []
-
-        # Hand Association
-        associated_hands = self._associate(detected_hands, active_tracks, img_w, img_h)
+        """Unified runner executing person detection, tracking, and hand association."""
+        active_tracks = self.detect_and_track_persons(frame)
+        associated_hands = self.associate_hands(frame, detected_hands, active_tracks)
         return associated_hands, active_tracks
 
     def _associate(

@@ -360,20 +360,28 @@ class OfflineVideoDetector:
                         break
                 processed_inference_frames += 1
 
-                # 1. Hand Inference
-                t_inf_start = time.perf_counter()
-                inf_res = self.hand_detector.detect(frame)
-                t_inf_end = time.perf_counter()
-                latency_ms = (t_inf_end - t_inf_start) * 1000.0
-                inference_latencies.append(latency_ms)
+                # 1. Person Detection & ByteTrack Tracking (Lightweight Stage)
+                active_tracks = self.tracker_pipeline.detect_and_track_persons(frame)
 
-                total_gloved_detections += len(inf_res.gloved_hands)
-                total_bare_detections += len(inf_res.bare_hands)
+                # 2. Person-Gated Hand Detection (Heavy RT-DETR-L Stage)
+                # Gloves detection is ONLY activated when at least one person is detected in the frame.
+                if len(active_tracks) > 0 or not self.tracker_pipeline.enable_pose:
+                    t_inf_start = time.perf_counter()
+                    inf_res = self.hand_detector.detect(frame)
+                    t_inf_end = time.perf_counter()
+                    latency_ms = (t_inf_end - t_inf_start) * 1000.0
+                    inference_latencies.append(latency_ms)
 
-                # 2. Tracking & Association
-                assoc_hands, active_tracks = self.tracker_pipeline.process(
-                    frame, inf_res.hands, frame_idx=frame_idx
-                )
+                    total_gloved_detections += len(inf_res.gloved_hands)
+                    total_bare_detections += len(inf_res.bare_hands)
+                    current_hands = inf_res.hands
+                else:
+                    # Area clear: No person present in CCTV frame -> skip hand detection
+                    inf_res = None
+                    current_hands = []
+
+                # 3. Hand-to-Person Association
+                assoc_hands = self.tracker_pipeline.associate_hands(frame, current_hands, active_tracks)
 
                 # 3. Compliance Evaluation
                 current_states: Dict[int, str] = {}
@@ -436,7 +444,7 @@ class OfflineVideoDetector:
 
                 # Update carry-forward cache
                 last_inference_pts = pts_sec
-                cached_hands = inf_res.hands
+                cached_hands = current_hands
                 cached_associations = assoc_hands
                 cached_tracks = active_tracks
                 cached_states = current_states
