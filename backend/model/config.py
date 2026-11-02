@@ -6,7 +6,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 import os
+import sys
+import warnings
 import torch
+
+# Clean PyTorch Windows allocator warnings
+warnings.filterwarnings("ignore", message=".*expandable_segments.*")
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
